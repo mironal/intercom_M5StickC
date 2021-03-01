@@ -3,15 +3,20 @@
 #include <driver/i2s.h>
 #include "fft.h"
 #include <CircularBuffer.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+
+QueueHandle_t notify_queue;
 
 extern const unsigned char ImageData[768];
 
-typedef struct {
+typedef struct
+{
 
     // fft step 5 と 7 (0始まり)の音の強さを保持
 
-    int val_step5;
-    int val_step7;
+    uint16_t val_step5;
+    uint16_t val_step7;
 
     // 前回サンプル値との差
     int d_step5;
@@ -19,14 +24,6 @@ typedef struct {
 } FftSample;
 
 TFT_eSprite Disbuff = TFT_eSprite(&M5.Lcd);
-
-void checkAXPPress()
-{
-	if( M5.Axp.GetBtnPress())
-	{
-		ESP.restart();
-	}
-}
 
 #define PIN_CLK 0
 #define PIN_DATA 34
@@ -50,7 +47,6 @@ bool InitI2SMicroPhone()
     pin_config.ws_io_num = PIN_CLK;
     pin_config.data_out_num = I2S_PIN_NO_CHANGE;
     pin_config.data_in_num = PIN_DATA;
-    
 
     err += i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     err += i2s_set_pin(I2S_NUM_0, &pin_config);
@@ -82,7 +78,7 @@ CircularBuffer<FftSample, 400> fft_sample_buff;
 
 bool CheckRing()
 {
-    int8_t prev_phase = 0;
+    int8_t max_phase = 0;
     int8_t phase = 0;
     uint16_t prev_phase_index = 0;
     for (uint16_t index = 0; index < fft_sample_buff.size(); index++)
@@ -120,7 +116,7 @@ bool CheckRing()
             }
             break;
         case 2:
-            if (sample.d_step5 > 50)
+            if (prev_phase_index + 30 < index && sample.d_step5 > 30)
             {
                 phase++;
                 prev_phase_index = index;
@@ -142,7 +138,18 @@ bool CheckRing()
             }
             break;
         case 4:
-            if (sample.d_step7 > 100)
+        {
+
+            // 立ち上がり前が静かだったことを確認する
+            bool quiet = true;
+            for (uint16_t i = index - 40; i < index; i++)
+            {
+                if (fft_sample_buff[i].d_step7 > 20)
+                {
+                    quiet = false;
+                }
+            }
+            if (prev_phase_index + 80 < index && sample.d_step7 > 100 && quiet)
             {
                 phase++;
                 prev_phase_index = index;
@@ -151,7 +158,8 @@ bool CheckRing()
             {
                 phase = -1;
             }
-            break;
+        }
+        break;
         case 5:
             if (sample.d_step7 < -10)
             {
@@ -165,6 +173,8 @@ bool CheckRing()
             break;
         }
 
+        max_phase = max(phase, max_phase);
+
         if (phase == 6)
         {
             return true;
@@ -174,12 +184,11 @@ bool CheckRing()
         {
             break;
         }
-        if (phase > prev_phase)
-        {
-            Serial.printf("change phase: %d\n", phase);
-        }
-
-        prev_phase = phase;
+    }
+    if (max_phase > 2)
+    {
+        // for debug
+        // Serial.printf("Max phase: %d\n", max_phase);
     }
     return false;
 }
@@ -213,8 +222,7 @@ void MicRecordfft(void *arg)
             .val_step5 = 0,
             .val_step7 = 0,
             .d_step5 = 0,
-            .d_step7 = 0
-        };
+            .d_step7 = 0};
         for (count_n = 1; count_n < real_fft_plan->size / 4; count_n++)
         {
             data = sqrt(real_fft_plan->output[2 * count_n] * real_fft_plan->output[2 * count_n] + real_fft_plan->output[2 * count_n + 1] * real_fft_plan->output[2 * count_n + 1]);
@@ -245,27 +253,36 @@ void MicRecordfft(void *arg)
         {
             fft_sample_buff.shift();
         }
-        if (!fft_sample_buff.push(sample)) {
+
+        if (!fft_sample_buff.push(sample))
+        {
             Serial.println("Invalid push");
         }
         if (fft_sample_buff.isFull())
         {
+            M5.update();
+            if (M5.BtnA.wasReleased()) // for debug
+            {
+                Serial.println("--------------------------------------");
+                for (int i = 0; i < fft_sample_buff.size(); i++)
+                {
+                    FftSample s = fft_sample_buff[i];
+                    Serial.printf("%d,%d,%d,%d\n", s.val_step5, s.val_step7, s.d_step5, s.d_step7);
+                }
+            }
+
             if (CheckRing())
             {
+                Serial.println("ring! ring!");
+                Serial.println("--------------------------------------");
+                for (int i = 0; i < fft_sample_buff.size(); i++)
+                {
+                    FftSample s = fft_sample_buff[i];
+                    Serial.printf("%d,%d,%d,%d\n", s.val_step5, s.val_step7, s.d_step5, s.d_step7);
+                }
+                bool notify = true;
+                xQueueOverwrite(notify_queue, &notify);
                 fft_sample_buff.clear();
-                Serial.println("CheckRing: true");
-            }
-        } else {
-            Serial.print(".");
-        }
-
-        M5.update();
-        if (M5.BtnA.wasReleased())
-        {
-            Serial.println("--------------------------------------");
-            for (int i = 0; i < fft_sample_buff.size(); i++ ){
-                FftSample s = fft_sample_buff[i];
-                Serial.printf("%d,%d,%d,%d\n", s.val_step5, s.val_step7, s.d_step5, s.d_step7);
             }
         }
 
@@ -307,8 +324,8 @@ void Drawdisplay(void *arg)
         xSemaphoreGive(xSemaphore);
         Disbuff.setTextColor(WHITE);
         Disbuff.setTextSize(1);
-        Disbuff.fillRect(0,0,70,18,Disbuff.color565(20,20,20));
-        Disbuff.drawString("MicroPhone",5,5,1);
+        Disbuff.fillRect(0, 0, 70, 18, Disbuff.color565(20, 20, 20));
+        Disbuff.drawString("MicroPhone", 5, 5, 1);
         Disbuff.pushSprite(0, 0);
     }
 }
@@ -325,23 +342,41 @@ void setup()
     M5.Lcd.setSwapBytes(false);
     Disbuff.createSprite(160, 80);
     Disbuff.setSwapBytes(true);
-    
+
+    delay(1000);
+
+    // 一度設定した後は Wifi チップ内のメモリに永続化されるので引数無しで接続可能
+    // 別の wifi につなぐときは再ビルドする
+    WiFi.begin();
+
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.printf("WiFi status: %d\n", WiFi.status());
+        delay(3000);
+    }
+    Serial.println("Wifi Connected");
+
     if (InitI2SMicroPhone() != true)
     {
-        // ErrorMeg(0x51, "MicroPhone error",0 ,true);
+        Serial.println("Error InitI2SMicroPhone");
+        while (true)
+        {
+        }
     }
 
-	int color_bk = 43;
-	for (int n = 116; n < 180; n=n+8)
-	{
-		Disbuff.fillEllipse(80,40,n/2, n/2, Disbuff.color565(color_bk,color_bk,color_bk));
-    	Displaybuff();
-		delay(20);
-		color_bk -= 5;
-	}
+    int color_bk = 43;
+    for (int n = 116; n < 180; n = n + 8)
+    {
+        Disbuff.fillEllipse(80, 40, n / 2, n / 2, Disbuff.color565(color_bk, color_bk, color_bk));
+        Displaybuff();
+        delay(20);
+        color_bk -= 5;
+    }
 
-	Disbuff.fillRect(0,0,160,80,BLACK);
-	Displaybuff();
+    Disbuff.fillRect(0, 0, 160, 80, BLACK);
+    Displaybuff();
+
+    notify_queue = xQueueCreate(1, sizeof(bool));
 
     xSemaphore = xSemaphoreCreateMutex();
     start_dis = xSemaphoreCreateMutex();
@@ -355,10 +390,64 @@ void setup()
 
     xSemaphoreGive(start_dis);
     xSemaphoreGive(start_fft);
+    Serial.println("setup finish");
+}
+
+#ifndef LINE_NOTIFY_TOKEN
+#error LINE_NOTIFY_TOKEN required
+#endif
+
+void sendNotification()
+{
+    Serial.println("sendNotification");
+    const char *host = "notify-api.line.me";
+    const char *token = LINE_NOTIFY_TOKEN;
+    WiFiClientSecure client;
+    if (!client.connect(host, 443))
+    {
+        return;
+    }
+
+    String query = String("message=") + "インターホンが鳴りました！！";
+
+    String request = String("") +
+                     "POST /api/notify HTTP/1.1\r\n" +
+                     "Host: " + host + "\r\n" +
+                     "Authorization: Bearer " + token + "\r\n" +
+                     "Content-Length: " + String(query.length()) + "\r\n" +
+                     "Content-Type: application/x-www-form-urlencoded\r\n\r\n" +
+                     query + "\r\n";
+
+    Serial.println(request);
+    Serial.println();
+    client.print(request);
+
+    while (client.connected())
+    {
+        String line = client.readStringUntil('\n');
+        if (line == "\r")
+        {
+            break;
+        }
+    }
+    String line = client.readStringUntil('\n');
+    Serial.println(line);
 }
 
 void loop()
 {
-    delay(100);
+    bool notify = false;
+    if (xQueueReceive(notify_queue, &notify, 0) && notify)
+    {
+        sendNotification();
+    }
 
+    M5.update();
+    if (M5.BtnB.wasReleased())
+    {
+        Serial.println("Test notify");
+        sendNotification();
+    }
+
+    delay(100);
 }
